@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import threading
@@ -217,6 +218,163 @@ class TemperatureChart(QWidget):
         painter.drawText(int(plot.left() + 140), 18, "电机温度")
 
 
+@dataclass(frozen=True)
+class MotionTarget:
+    mode: str
+    position: float | None
+    velocity: float | None
+    torque: float | None
+
+
+@dataclass(frozen=True)
+class MotionSample:
+    timestamp: datetime
+    mode: str
+    target_position: float | None
+    actual_position: float
+    target_velocity: float | None
+    actual_velocity: float
+    target_torque: float | None
+    actual_torque: float
+
+
+class MotionChart(QWidget):
+    """Scrolling target/actual plots for position, velocity and torque."""
+
+    SERIES = (
+        ("位置", "rad", "target_position", "actual_position"),
+        ("速度", "rad/s", "target_velocity", "actual_velocity"),
+        ("力矩", "Nm", "target_torque", "actual_torque"),
+    )
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.samples: list[MotionSample] = []
+        self.window_seconds = 120.0
+        self.setMinimumHeight(350)
+
+    def set_samples(self, samples: list[MotionSample]) -> None:
+        self.samples = samples
+        self.update()
+
+    @staticmethod
+    def _format_axis(value: float) -> str:
+        magnitude = abs(value)
+        if magnitude >= 100:
+            return f"{value:.0f}"
+        if magnitude >= 10:
+            return f"{value:.1f}"
+        return f"{value:.2f}"
+
+    def paintEvent(self, _event) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#ffffff"))
+
+        left = 70.0
+        right = max(left + 10.0, float(self.width() - 18))
+        top = 42.0
+        bottom = max(top + 30.0, float(self.height() - 30))
+        gap = 20.0
+        panel_height = max(30.0, (bottom - top - gap * 2) / 3.0)
+        now = self.samples[-1].timestamp.timestamp() if self.samples else time.time()
+        start = now - self.window_seconds
+        visible = [sample for sample in self.samples if sample.timestamp.timestamp() >= start][-6000:]
+        maximum_draw_points = max(300, int(right - left) * 2)
+        if len(visible) > maximum_draw_points:
+            stride = max(1, len(visible) // maximum_draw_points)
+            reduced = visible[::stride]
+            if reduced[-1] is not visible[-1]:
+                reduced.append(visible[-1])
+            visible = reduced
+
+        for panel_index, (title, unit, target_attr, actual_attr) in enumerate(self.SERIES):
+            panel_top = top + panel_index * (panel_height + gap)
+            plot = QRectF(left, panel_top, right - left, panel_height)
+            painter.setPen(QPen(QColor("#adb5bd"), 1))
+            painter.drawRect(plot)
+
+            values: list[float] = []
+            for sample in visible:
+                actual = float(getattr(sample, actual_attr))
+                target = getattr(sample, target_attr)
+                values.append(actual)
+                if target is not None:
+                    values.append(float(target))
+            if values:
+                y_min = min(min(values), 0.0)
+                y_max = max(max(values), 0.0)
+                span = y_max - y_min
+                padding = max(span * 0.12, 0.05 if title == "力矩" else 0.1)
+                y_min -= padding
+                y_max += padding
+            else:
+                y_min, y_max = -1.0, 1.0
+
+            def map_x(stamp: datetime) -> float:
+                return plot.left() + plot.width() * (stamp.timestamp() - start) / self.window_seconds
+
+            def map_y(value: float) -> float:
+                clipped = max(y_min, min(y_max, value))
+                return plot.bottom() - plot.height() * (clipped - y_min) / (y_max - y_min)
+
+            for grid_index in range(5):
+                value = y_min + (y_max - y_min) * grid_index / 4.0
+                y = map_y(value)
+                painter.setPen(QPen(QColor("#edf0f2"), 1))
+                painter.drawLine(int(plot.left()), int(y), int(plot.right()), int(y))
+                painter.setPen(QColor("#495057"))
+                painter.drawText(3, int(y + 4), self._format_axis(value))
+
+            if y_min <= 0.0 <= y_max:
+                zero_y = map_y(0.0)
+                painter.setPen(QPen(QColor("#ced4da"), 1, Qt.DashLine))
+                painter.drawLine(int(plot.left()), int(zero_y), int(plot.right()), int(zero_y))
+
+            painter.setPen(QColor("#212529"))
+            painter.drawText(int(plot.left()), int(plot.top() - 7), f"{title} ({unit})")
+
+            if visible:
+                actual_path = QPainterPath()
+                for index, sample in enumerate(visible):
+                    point = (map_x(sample.timestamp), map_y(float(getattr(sample, actual_attr))))
+                    if index == 0:
+                        actual_path.moveTo(*point)
+                    else:
+                        actual_path.lineTo(*point)
+                painter.setPen(QPen(QColor("#0d6efd"), 2))
+                painter.drawPath(actual_path)
+
+                target_path = QPainterPath()
+                target_started = False
+                for sample in visible:
+                    target = getattr(sample, target_attr)
+                    if target is None:
+                        target_started = False
+                        continue
+                    point = (map_x(sample.timestamp), map_y(float(target)))
+                    if not target_started:
+                        target_path.moveTo(*point)
+                        target_started = True
+                    else:
+                        target_path.lineTo(*point)
+                painter.setPen(QPen(QColor("#dc6b19"), 2, Qt.DashLine))
+                painter.drawPath(target_path)
+            else:
+                painter.setPen(QColor("#6c757d"))
+                painter.drawText(plot, Qt.AlignCenter, "等待 DM 运动反馈…")
+
+        painter.setPen(QPen(QColor("#dc6b19"), 2, Qt.DashLine))
+        painter.drawLine(int(left), 14, int(left + 25), 14)
+        painter.setPen(QColor("#212529"))
+        painter.drawText(int(left + 31), 19, "目标")
+        painter.setPen(QPen(QColor("#0d6efd"), 2))
+        painter.drawLine(int(left + 92), 14, int(left + 117), 14)
+        painter.setPen(QColor("#212529"))
+        painter.drawText(int(left + 123), 19, "实际反馈")
+        painter.drawText(int(right - 94), 19, f"最近 {int(self.window_seconds)} 秒")
+
+
 class MainWindow(QMainWindow):
     GB_CANOPEN = "gb_canopen"
     DM_CLASSIC = "dm_classic"
@@ -225,7 +383,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("GB5753H 样机 · DM 兼容 CAN 电机测试工具 0.5")
+        self.setWindowTitle("GB5753H 样机 · DM 兼容 CAN 电机测试工具 0.6")
         self.resize(1280, 820)
         self.session = CanSession()
         self.session.frame_received.connect(self._on_frame)
@@ -239,6 +397,16 @@ class MainWindow(QMainWindow):
             "drive_max": None,
             "motor_min": None,
             "motor_max": None,
+        }
+        self.motion_samples: list[MotionSample] = []
+        self.last_motion_target: MotionTarget | None = None
+        self.motion_extrema: dict[str, float | None] = {
+            "position_min": None,
+            "position_max": None,
+            "velocity_min": None,
+            "velocity_max": None,
+            "torque_min": None,
+            "torque_max": None,
         }
         self.object_entries: list[ObjectEntry] = []
         self._object_lookup: dict[tuple[int, int], ObjectEntry] = {}
@@ -300,9 +468,11 @@ class MainWindow(QMainWindow):
         self.gb_tab = self._build_gb_tab()
         self.dm_tab = self._build_dm_tab()
         self.temperature_tab = self._build_temperature_tab()
+        self.motion_tab = self._build_motion_tab()
         self.protocol_tabs.addTab(self.gb_tab, "其他版本 CANopen FD")
         self.protocol_tabs.addTab(self.dm_tab, "GB5753H 样机 / DM 协议")
         self.protocol_tabs.addTab(self.temperature_tab, "温度监测")
+        self.protocol_tabs.addTab(self.motion_tab, "运动监测")
         return self.protocol_tabs
 
     def _build_gb_tab(self) -> QWidget:
@@ -554,6 +724,66 @@ class MainWindow(QMainWindow):
         layout.addLayout(actions)
         return page
 
+    def _build_motion_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        notice = QLabel(
+            "曲线随 DM 反馈帧更新，并使用最后一次实际发送成功的控制目标。"
+            "MIT 模式的目标力矩对应前馈力矩 t_ff；"
+            "位置-速度模式中的目标速度是梯形轨迹最高速度；速度模式没有位置目标，"
+            "位置-速度和速度模式没有前馈力矩目标，因此对应目标显示为—。"
+        )
+        notice.setWordWrap(True)
+        notice.setStyleSheet("background:#cff4fc; color:#055160; padding:8px; border:1px solid #b6effb;")
+        layout.addWidget(notice)
+
+        summary = QGroupBox("运动概览")
+        grid = QGridLayout(summary)
+        for column, title in enumerate(("参数", "目标", "实际反馈", "误差（目标-实际）", "实际最低/最高")):
+            header = QLabel(title)
+            header.setStyleSheet("font-weight:bold;")
+            grid.addWidget(header, 0, column)
+
+        self.motion_labels: dict[str, QLabel] = {}
+        metrics = (
+            ("position", "位置", "rad"),
+            ("velocity", "速度", "rad/s"),
+            ("torque", "力矩", "Nm"),
+        )
+        for row, (key, title, unit) in enumerate(metrics, start=1):
+            grid.addWidget(QLabel(f"{title} ({unit})"), row, 0)
+            for column, suffix in enumerate(("target", "actual", "error", "range"), start=1):
+                label = QLabel("—")
+                label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                if suffix in {"target", "actual"}:
+                    label.setStyleSheet("font-weight:bold;")
+                self.motion_labels[f"{key}_{suffix}"] = label
+                grid.addWidget(label, row, column)
+
+        self.motion_mode_label = QLabel("尚未发送运动指令")
+        self.motion_mode_label.setStyleSheet("font-weight:bold; color:#495057;")
+        grid.addWidget(QLabel("最后目标模式"), 4, 0)
+        grid.addWidget(self.motion_mode_label, 4, 1, 1, 4)
+        layout.addWidget(summary)
+
+        self.motion_chart = MotionChart()
+        self.motion_chart.set_samples(self.motion_samples)
+        layout.addWidget(self.motion_chart, 1)
+
+        actions = QHBoxLayout()
+        clear_button = QPushButton("清空运动记录")
+        clear_button.clicked.connect(self._clear_motion_history)
+        export_button = QPushButton("导出运动 CSV")
+        export_button.clicked.connect(self._export_motion_csv)
+        self.motion_sample_count = QLabel("0 个反馈采样点（最多保留 10000 个）")
+        actions.addWidget(clear_button)
+        actions.addWidget(export_button)
+        actions.addWidget(self.motion_sample_count)
+        actions.addStretch()
+        layout.addLayout(actions)
+        return page
+
     def _build_status_panel(self) -> QWidget:
         panel = QWidget()
         layout = QVBoxLayout(panel)
@@ -728,6 +958,7 @@ class MainWindow(QMainWindow):
 
     def _on_connection_changed(self, connected: bool) -> None:
         self.connected = connected
+        self.last_motion_target = None
         self.connection_label.setText("● 已连接" if connected else "● 未连接")
         self.connection_label.setStyleSheet(
             "color:#157347; font-weight:bold;" if connected else "color:#a22; font-weight:bold;"
@@ -802,7 +1033,14 @@ class MainWindow(QMainWindow):
         try:
             frame = pack_special(self.dm_motor_id.value(), command)
             labels = {"enable": "使能", "disable": "失能", "set_zero": "保存零点", "clear_error": "清错"}
-            self._send_frame(frame, labels[command])
+            previous_target = self.last_motion_target
+            self.last_motion_target = None
+            try:
+                self._send_frame(frame, labels[command])
+            except Exception:
+                self.last_motion_target = previous_target
+                raise
+            self.motion_mode_label.setText("尚未发送运动指令")
             if command == "enable":
                 self.dm_enabled = True
             elif command == "disable":
@@ -829,12 +1067,39 @@ class MainWindow(QMainWindow):
             return pack_position_velocity(motor_id, self.pv_position.value(), self.pv_velocity.value())
         return pack_velocity(motor_id, self.velocity_value.value())
 
+    def _current_motion_target(self) -> MotionTarget:
+        index = self.control_tabs.currentIndex()
+        if index == 0:
+            return MotionTarget(
+                "MIT",
+                float(self.mit_position.value()),
+                float(self.mit_velocity.value()),
+                float(self.mit_torque.value()),
+            )
+        if index == 1:
+            return MotionTarget(
+                "位置-速度（速度为轨迹上限）",
+                float(self.pv_position.value()),
+                float(self.pv_velocity.value()),
+                None,
+            )
+        return MotionTarget("速度", None, float(self.velocity_value.value()), None)
+
     def _send_current_control(self) -> None:
         if not self.connected or not self.safety_check.isChecked():
             self.periodic_check.setChecked(False)
             return
         try:
-            self._send_frame(self._current_control_frame(), "控制指令")
+            frame = self._current_control_frame()
+            target = self._current_motion_target()
+            previous_target = self.last_motion_target
+            self.last_motion_target = target
+            try:
+                self._send_frame(frame, "控制指令")
+            except Exception:
+                self.last_motion_target = previous_target
+                raise
+            self.motion_mode_label.setText(target.mode)
         except Exception as exc:
             self.periodic_check.setChecked(False)
             self._show_send_error(exc)
@@ -939,6 +1204,7 @@ class MainWindow(QMainWindow):
                     self.status_values["电机温度"].setText(f"{feedback.rotor_temperature} ℃")
                     self.status_values["最后反馈"].setText(datetime.now().strftime("%H:%M:%S.%f")[:-3])
                     self._record_temperature(feedback.mos_temperature, feedback.rotor_temperature)
+                    self._record_motion(feedback.position, feedback.velocity, feedback.torque)
                     self.dm_enabled = feedback.state_code == 1
                     self._update_actions()
                 except ProtocolError as exc:
@@ -971,6 +1237,62 @@ class MainWindow(QMainWindow):
         self.temperature_sample_count.setText(f"{len(self.temperature_samples)} 个采样点（最多保留 10000 个）")
         self.temperature_chart.update()
         self._update_temperature_alarm(drive_temperature, motor_temperature)
+
+    def _record_motion(self, position: float, velocity: float, torque: float) -> None:
+        target = self.last_motion_target
+        sample = MotionSample(
+            timestamp=datetime.now(),
+            mode=target.mode if target is not None else "无运动目标",
+            target_position=target.position if target is not None else None,
+            actual_position=float(position),
+            target_velocity=target.velocity if target is not None else None,
+            actual_velocity=float(velocity),
+            target_torque=target.torque if target is not None else None,
+            actual_torque=float(torque),
+        )
+        self.motion_samples.append(sample)
+        if len(self.motion_samples) > 10000:
+            del self.motion_samples[: len(self.motion_samples) - 10000]
+
+        actual_values = {
+            "position": sample.actual_position,
+            "velocity": sample.actual_velocity,
+            "torque": sample.actual_torque,
+        }
+        for key, value in actual_values.items():
+            minimum_key = f"{key}_min"
+            maximum_key = f"{key}_max"
+            current_min = self.motion_extrema[minimum_key]
+            current_max = self.motion_extrema[maximum_key]
+            self.motion_extrema[minimum_key] = value if current_min is None else min(current_min, value)
+            self.motion_extrema[maximum_key] = value if current_max is None else max(current_max, value)
+
+        units = {"position": "rad", "velocity": "rad/s", "torque": "Nm"}
+        targets = {
+            "position": sample.target_position,
+            "velocity": sample.target_velocity,
+            "torque": sample.target_torque,
+        }
+        for key, actual in actual_values.items():
+            unit = units[key]
+            target_value = targets[key]
+            self.motion_labels[f"{key}_target"].setText(
+                "—" if target_value is None else f"{target_value:.5f} {unit}"
+            )
+            self.motion_labels[f"{key}_actual"].setText(f"{actual:.5f} {unit}")
+            self.motion_labels[f"{key}_error"].setText(
+                "—" if target_value is None else f"{target_value - actual:+.5f} {unit}"
+            )
+            self.motion_labels[f"{key}_range"].setText(
+                f"{self.motion_extrema[f'{key}_min']:.5f} / "
+                f"{self.motion_extrema[f'{key}_max']:.5f} {unit}"
+            )
+
+        self.motion_mode_label.setText(sample.mode)
+        self.motion_sample_count.setText(
+            f"{len(self.motion_samples)} 个反馈采样点（最多保留 10000 个）"
+        )
+        self.motion_chart.update()
 
     def _temperature_thresholds_changed(self, _value: int = 0) -> None:
         warning = float(self.temperature_warning_spin.value())
@@ -1045,6 +1367,85 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "导出失败", str(exc))
             return
         QMessageBox.information(self, "导出完成", f"已导出 {len(self.temperature_samples)} 个采样点：\n{path}")
+
+    def _clear_motion_history(self) -> None:
+        self.motion_samples.clear()
+        for key in self.motion_extrema:
+            self.motion_extrema[key] = None
+        for label in self.motion_labels.values():
+            label.setText("—")
+        self.motion_mode_label.setText(
+            self.last_motion_target.mode if self.last_motion_target is not None else "尚未发送运动指令"
+        )
+        self.motion_sample_count.setText("0 个反馈采样点（最多保留 10000 个）")
+        self.motion_chart.update()
+
+    def _export_motion_csv(self) -> None:
+        if not self.motion_samples:
+            QMessageBox.information(self, "没有运动数据", "收到电机反馈后才能导出运动记录。")
+            return
+        suggested = f"GB5753H_motion_{datetime.now():%Y%m%d_%H%M%S}.csv"
+        path, _selected_filter = QFileDialog.getSaveFileName(
+            self, "导出运动记录", str(ROOT / suggested), "CSV 文件 (*.csv)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".csv"):
+            path += ".csv"
+
+        def csv_value(value: float | None) -> str:
+            return "" if value is None else f"{value:.7f}"
+
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as stream:
+                writer = csv.writer(stream)
+                writer.writerow(
+                    (
+                        "timestamp",
+                        "mode",
+                        "target_position_rad",
+                        "actual_position_rad",
+                        "position_error_rad",
+                        "target_velocity_rad_s",
+                        "actual_velocity_rad_s",
+                        "velocity_error_rad_s",
+                        "target_torque_nm",
+                        "actual_torque_nm",
+                        "torque_error_nm",
+                    )
+                )
+                for sample in self.motion_samples:
+                    writer.writerow(
+                        (
+                            sample.timestamp.isoformat(timespec="milliseconds"),
+                            sample.mode,
+                            csv_value(sample.target_position),
+                            csv_value(sample.actual_position),
+                            csv_value(
+                                None
+                                if sample.target_position is None
+                                else sample.target_position - sample.actual_position
+                            ),
+                            csv_value(sample.target_velocity),
+                            csv_value(sample.actual_velocity),
+                            csv_value(
+                                None
+                                if sample.target_velocity is None
+                                else sample.target_velocity - sample.actual_velocity
+                            ),
+                            csv_value(sample.target_torque),
+                            csv_value(sample.actual_torque),
+                            csv_value(
+                                None
+                                if sample.target_torque is None
+                                else sample.target_torque - sample.actual_torque
+                            ),
+                        )
+                    )
+        except OSError as exc:
+            QMessageBox.critical(self, "导出失败", str(exc))
+            return
+        QMessageBox.information(self, "导出完成", f"已导出 {len(self.motion_samples)} 个采样点：\n{path}")
 
     def _append_log(self, direction: str, frame: CanFrame, note: str) -> None:
         row = self.log_table.rowCount()
