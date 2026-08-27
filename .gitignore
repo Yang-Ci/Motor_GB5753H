@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.exe
+*.pdf
+DM1MCAN标准协议.png
+华翼关节模组对象字典V11(只读).xlsx
+HY_Motion_Studio.cfg
+.venv/
+venv/
+dist/
+build/
+.pytest_cache/
+.coverage
